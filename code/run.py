@@ -29,6 +29,7 @@ if __name__ == "__main__":
     from app import create_demo
     demo = create_demo()
     demo.launch(
+        server_name="0.0.0.0",
         server_port=args.port,
         share=args.share,
     )
