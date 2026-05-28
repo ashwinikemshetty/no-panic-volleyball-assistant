@@ -7,13 +7,14 @@ from datetime import datetime, timedelta, date
 def resolve_date(date_expr: Optional[str]) -> Optional[date]:
     """Resolve date expressions to actual dates.
 
-    Handles: "today", "tomorrow", "yesterday", "05/27/2026", "27/05/2026", "May 27", etc.
+    Handles: "today", "tomorrow", "yesterday", "upcoming", "05/27/2026", "27/05/2026", "May 27", etc.
+    Returns None for "upcoming" to indicate "all upcoming sessions".
 
     Args:
         date_expr: User-provided date string or None
 
     Returns:
-        Resolved date object, or None if no date mentioned or parse fails
+        Resolved date object, or None if no date mentioned, "upcoming", or parse fails
     """
     if not date_expr or not str(date_expr).strip():
         return None
@@ -28,6 +29,30 @@ def resolve_date(date_expr: Optional[str]) -> Optional[date]:
         return today + timedelta(days=1)
     elif date_expr == "yesterday":
         return today - timedelta(days=1)
+    elif "upcoming" in date_expr or "next" in date_expr:
+        # Return None to indicate "all upcoming sessions from today"
+        return None
+
+    # Handle month names (june, july, etc.) - return None to signal month-based query
+    month_names = {
+        "january": 1, "jan": 1,
+        "february": 2, "feb": 2,
+        "march": 3, "mar": 3,
+        "april": 4, "apr": 4,
+        "may": 5,
+        "june": 6, "jun": 6,
+        "july": 7, "jul": 7,
+        "august": 8, "aug": 8,
+        "september": 9, "sep": 9, "sept": 9,
+        "october": 10, "oct": 10,
+        "november": 11, "nov": 11,
+        "december": 12, "dec": 12,
+    }
+
+    for month_name in month_names.keys():
+        if month_name in date_expr:
+            # Return None to indicate "month-based query" - will be handled specially
+            return None
 
     # Try standard date parsing (MM/DD/YYYY, DD/MM/YYYY, Month Day Year, etc.)
     # Try MM/DD/YYYY first (US format)
@@ -212,21 +237,45 @@ class ScheduleLoader:
 
         return sorted(matches.to_dict("records"), key=lambda x: x.get("start", ""))
 
-    def query_by_date(self, date_val: date) -> List[Dict]:
-        """Get all sessions on a specific date.
+    def query_by_date(self, date_val: Optional[date] = None) -> List[Dict]:
+        """Get all sessions on a specific date, or upcoming sessions if date_val is None.
 
         Args:
-            date_val: Date object
+            date_val: Date object, or None to get upcoming sessions from today onwards
 
         Returns:
-            List of all sessions on that date, sorted by start time
+            List of all sessions on that date (or upcoming), sorted by start time
         """
         if self.df is None or self.df.empty:
             return []
 
-        date_val = pd.Timestamp(date_val).date() if not isinstance(date_val, date) else date_val
-        matches = self.df[pd.to_datetime(self.df["date"]).dt.date == date_val]
+        if date_val is None:
+            # Return upcoming sessions from today onwards
+            today = datetime.now().date()
+            matches = self.df[pd.to_datetime(self.df["date"]).dt.date >= today]
+        else:
+            date_val = pd.Timestamp(date_val).date() if not isinstance(date_val, date) else date_val
+            matches = self.df[pd.to_datetime(self.df["date"]).dt.date == date_val]
+
         return sorted(matches.to_dict("records"), key=lambda x: x.get("start", ""))
+
+    def query_by_month(self, year: int, month: int) -> List[Dict]:
+        """Get all sessions in a specific month.
+
+        Args:
+            year: Year (e.g., 2026)
+            month: Month (1-12)
+
+        Returns:
+            List of all sessions in that month, sorted by date and start time
+        """
+        if self.df is None or self.df.empty:
+            return []
+
+        df_dates = pd.to_datetime(self.df["date"])
+        matches = self.df[(df_dates.dt.year == year) & (df_dates.dt.month == month)]
+
+        return sorted(matches.to_dict("records"), key=lambda x: (x.get("date", ""), x.get("start", "")))
 
     def to_text(self) -> str:
         """Convert schedule to readable text format for debugging/review.

@@ -6,6 +6,7 @@ from typing_extensions import TypedDict
 
 import pdfplumber
 import pandas as pd
+from tavily import TavilyClient
 
 from langchain.chat_models import init_chat_model
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -33,6 +34,8 @@ class GraphState(TypedDict):
     query_type: str
     schedule_entities: Dict
     schedule_result: str
+    web_search_results: str
+    use_web_search: bool
 
 
 DOCS_DIR = os.path.join(
@@ -62,13 +65,17 @@ ENSEMBLE_K = 8
 
 SYSTEM_PROMPT = """You are a helpful assistant for No Panic Volleyball Club, answering questions for parents and players.
 
-You have access to the official No Panic Club Packet (2026) and Coach Packet (2025).
+You have access to:
+1. Official No Panic Club Packet (2026) and Coach Packet (2025)
+2. Information from the No Panic Volleyball Club website (nopanicvolleyball.com)
+
 Always:
 - Answer directly from the provided context
-- If the information is not in the context, say so clearly rather than guessing
-- Include specific details like dates, names, contact emails when available in the context
+- If the information is not available in any source, say so clearly rather than guessing
+- Include specific details like dates, names, contact emails when available
 - Keep answers concise but complete
-- When citing information, reference the source document and page number like: (Coach Packet 2025, p.12)
+- When citing official documents, reference the source like: (Coach Packet 2025, p.12)
+- When citing website information, indicate it came from the club website
 """
 
 
@@ -139,9 +146,11 @@ class VolleyballRAGChat:
         self.cache_store = None
         self.graph = None
         self.memory_cache = {}  # Simple in-memory cache for exact matches
+        self.schedule_cache = {}  # Cache for schedule queries with temporal validity
         self.all_documents = []  # Store for BM25Retriever
         self.bm25_retriever = None
         self.schedule_loader = None  # Schedule query interface
+        self.tavily_client = None  # Web search client
 
     def initialize(self, force_reindex: bool = False) -> None:
         """Initialize LLM, embeddings, vector store, and graph.
@@ -149,6 +158,14 @@ class VolleyballRAGChat:
         Args:
             force_reindex: If True, clear and rebuild the vector store from documents.
         """
+        # Initialize Tavily web search client
+        tavily_api_key = os.getenv("TAVILY_API_KEY")
+        if tavily_api_key:
+            self.tavily_client = TavilyClient(api_key=tavily_api_key)
+            print("Tavily web search initialized.")
+        else:
+            print("WARNING: TAVILY_API_KEY not found in environment.")
+
         # Load schedule
         print("Loading schedule...")
         self.schedule_loader = ScheduleLoader(SCHEDULE_FILE)
@@ -407,12 +424,63 @@ class VolleyballRAGChat:
 
         if not docs:
             print(f"WARNING: No docs retrieved for: {query}")
-        return {"documents": docs}
+
+        # Flag for web search if no documents found or low confidence match for general queries
+        use_web_search = (not docs or len(docs) == 0) and state.get("query_type") == "general"
+        if use_web_search:
+            print(f"[WEB SEARCH TRIGGERED] No relevant docs found for: {query}")
+        return {"documents": docs, "use_web_search": use_web_search}
+
+    def search_web(self, state: GraphState) -> dict:
+        """Search the No Panic Volleyball Club website using Tavily."""
+        # Can be called from graph flow or from generate_answer fallback
+        query = state.get("question", "")
+
+        if not query or not self.tavily_client:
+            print(f"[WEB SEARCH] Skipped - query: {bool(query)}, client: {bool(self.tavily_client)}")
+            return {"web_search_results": "", "use_web_search": False}
+
+        print(f"[WEB SEARCH] Searching nopanicvolleyball.com for: {query}")
+
+        try:
+            response = self.tavily_client.search(
+                query=query,
+                max_results=5,
+                topic="general",
+                include_answer=True,
+                include_domains=["nopanicvolleyball.com"]
+            )
+
+            results = []
+            if response.get("answer"):
+                results.append(f"Answer: {response['answer']}\n")
+
+            search_results = response.get("results", [])
+            for result in search_results:
+                title = result.get("title", "")
+                content = result.get("content", "")
+                url = result.get("url", "")
+                results.append(f"{title}\n{content}\nSource: {url}\n")
+
+            web_search_results = "\n".join(results) if results else ""
+
+            if search_results:
+                print(f"[WEB SEARCH] Found {len(search_results)} results on nopanicvolleyball.com")
+                return {"web_search_results": web_search_results, "use_web_search": True}
+            else:
+                print(f"[WEB SEARCH] No results found on nopanicvolleyball.com")
+                return {"web_search_results": "", "use_web_search": False}
+        except Exception as e:
+            print(f"[WEB SEARCH] Failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"web_search_results": "", "use_web_search": False}
 
     def generate_answer(self, state: GraphState) -> dict:
-        """Generate answer using retrieved documents, schedule results, and user preferences."""
+        """Generate answer using retrieved documents, schedule results, web search, and user preferences."""
         query_type = state.get("query_type", "general")
         schedule_result = state.get("schedule_result", "")
+        web_search_results = state.get("web_search_results", "")
 
         # Handle clarification requests
         if schedule_result == "CLARIFY_TEAM":
@@ -431,6 +499,7 @@ class VolleyballRAGChat:
 
         # Build context based on query type
         context = ""
+        insufficient_docs = False
 
         if query_type == "schedule":
             # Use schedule result as primary context
@@ -446,11 +515,35 @@ class VolleyballRAGChat:
 
             context = f"{schedule_context}\n\nClub Information:\n{doc_context}"
         else:  # general
-            # Use document retrieval (existing behavior)
-            context = "\n\n".join([
-                f"[Source: {doc.metadata.get('source', 'Unknown')}, Page {doc.metadata.get('page', '?')}]\n{doc.page_content}"
-                for doc in state["documents"]
-            ])
+            # Use document retrieval or web search
+            if state.get("documents"):
+                context = "\n\n".join([
+                    f"[Source: {doc.metadata.get('source', 'Unknown')}, Page {doc.metadata.get('page', '?')}]\n{doc.page_content}"
+                    for doc in state["documents"]
+                ])
+                # For general queries, always supplement with web search to ensure comprehensive answers
+                insufficient_docs = True
+            elif web_search_results:
+                context = f"Web Search Results:\n{web_search_results}"
+            else:
+                context = "No information found in local documents or web search."
+                insufficient_docs = True
+
+        # For general queries with insufficient docs, also search the web
+        print(f"[GENERATE] query_type={query_type}, insufficient_docs={insufficient_docs}, web_search_results={bool(web_search_results)}")
+        if query_type == "general" and insufficient_docs and not web_search_results:
+            print(f"[FALLBACK WEB SEARCH] Triggering web search for general query")
+            web_result = self.search_web(state)
+            print(f"[FALLBACK WEB SEARCH] Got result: {bool(web_result.get('web_search_results'))}")
+            if web_result.get("web_search_results"):
+                web_search_results = web_result["web_search_results"]
+                if context != "No information found in local documents or web search.":
+                    context += f"\n\nWeb Search Results:\n{web_search_results}"
+                else:
+                    context = f"Web Search Results:\n{web_search_results}"
+                print(f"[FALLBACK WEB SEARCH] Added web results to context")
+            else:
+                print(f"[FALLBACK WEB SEARCH] No web results returned")
 
         # Inject preferences into system prompt if present
         effective_system_prompt = SYSTEM_PROMPT
@@ -551,20 +644,25 @@ class VolleyballRAGChat:
         prompt = (
             "You are extracting structured schedule query parameters from a user question.\n\n"
             "Extract the following from the question and conversation history:\n"
-            "- team_name: exact team name mentioned (or null if none)\n"
+            "- team_name: exact team name mentioned (or null if user says 'any team', 'all teams', or doesn't specify)\n"
             "- gender_filter: 'girls' or 'boys' if asking about a gender group (or null)\n"
-            "- date_expr: date mention like 'today', '05/27/2026', 'May 27', etc. (or null if none)\n"
-            "- is_count: true if asking 'how many', false otherwise\n"
+            "- date_expr: date mention like 'today', 'tomorrow', 'june', 'May 27', 'next week', 'upcoming', '05/27/2026', etc. (or null if none)\n"
+            "- is_count: true if asking 'how many' or 'upcoming X sessions', false otherwise\n"
             "- court_only: true if only asking for court/space, false if also asking for times\n"
-            "- needs_clarification: 'team' if ambiguous (multiple teams in history, pronoun used), "
-            "'date' if team known but date missing, or null if clear\n\n"
+            "- needs_clarification: 'team' ONLY if user hasn't explicitly said 'any team'/'all teams' AND multiple teams in history AND question is truly ambiguous,\n"
+            "  'date' ONLY if team known AND no date in current question AND no date anywhere in recent history, or null if clear\n\n"
+            "Date extraction rules:\n"
+            "- 'june', 'july', 'may', etc. → these ARE valid date expressions\n"
+            "- 'for june', 'in june', 'month of june' → extract 'june' as date_expr\n"
+            "- If user mentions a month or specific timeframe, DO NOT set needs_clarification='date'\n"
+            "- 'next week', 'this week', 'upcoming' → all valid date expressions\n\n"
             "Context resolution:\n"
-            "1. If the question uses pronouns ('they', 'their', 'the team') without explicit name,\n"
+            "1. If user says 'any team', 'all teams', 'for any team', set team_name=null and needs_clarification=null\n"
+            "2. If question uses pronouns ('they', 'their', 'the team') without explicit name,\n"
             "   look back in chat history for the last explicitly mentioned team name.\n"
-            "2. If TWO or more distinct teams appear in history and current question is ambiguous,\n"
-            "   set needs_clarification='team' (don't guess which one).\n"
-            "3. If a team is known but no date in question and no recent date in history,\n"
-            "   set needs_clarification='date'.\n\n"
+            "3. ONLY ask for team clarification if user hasn't explicitly said 'any team' AND multiple teams exist in history.\n"
+            "4. ONLY ask for date clarification if BOTH: (a) team is known, (b) NO date anywhere in question AND NO date anywhere in history.\n"
+            "5. If user has already mentioned a date in this conversation, DO NOT ask for clarification.\n\n"
             f"Chat history:\n{history_text}\n\n"
             f"Current question: {state['question']}\n"
             f"User preferences: {state.get('user_preferences', '')}\n\n"
@@ -611,12 +709,62 @@ class VolleyballRAGChat:
 
         # Resolve date if provided
         date_val = None
+        is_month_query = False
+        month_num = None
+
         if entities.get("date_expr"):
-            date_val = resolve_date(entities["date_expr"])
+            date_expr = entities["date_expr"].lower()
+
+            # Check if it's a month-based query
+            month_names = {
+                "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+                "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+                "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+                "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+            }
+            for month_name, num in month_names.items():
+                if month_name in date_expr:
+                    is_month_query = True
+                    month_num = num
+                    break
+
+            if not is_month_query:
+                date_val = resolve_date(entities["date_expr"])
 
         # Execute appropriate query
         results = []
-        if entities.get("team_name"):
+        if is_month_query and month_num:
+            # Query all sessions in the specified month
+            from datetime import datetime
+            current_year = datetime.now().year
+            month_results = self.schedule_loader.query_by_month(current_year, month_num)
+
+            # Filter by team or gender if specified
+            if entities.get("team_name"):
+                results = [r for r in month_results if entities["team_name"].lower() in str(r.get("teams", "")).lower()]
+            elif entities.get("gender_filter"):
+                if not self.schedule_loader.team_gender_cache:
+                    def llm_classify(team_names):
+                        prompt = (
+                            "Classify each team name as 'girls', 'boys', 'mixed', or 'other'.\n\n"
+                            "Teams:\n" + "\n".join(f"- {t}" for t in team_names) + "\n\n"
+                            "Return JSON: {team_name: gender_label, ...}"
+                        )
+                        import json
+                        response = self.llm.invoke(prompt).content.strip()
+                        start = response.find("{")
+                        end = response.rfind("}") + 1
+                        if start >= 0 and end > start:
+                            return json.loads(response[start:end])
+                        return {}
+                    self.schedule_loader.classify_teams_by_gender(llm_classify)
+
+                matching_teams = [t for t, g in self.schedule_loader.team_gender_cache.items()
+                                 if g.lower() == entities["gender_filter"].lower()]
+                results = [r for r in month_results if any(t in str(r.get("teams", "")) for t in matching_teams)]
+            else:
+                results = month_results
+        elif entities.get("team_name"):
             results = self.schedule_loader.query_by_team(entities["team_name"], date_val)
         elif entities.get("gender_filter"):
             # Classify teams if not done yet
@@ -639,7 +787,11 @@ class VolleyballRAGChat:
 
             results = self.schedule_loader.query_by_gender(entities["gender_filter"], date_val)
         elif date_val:
+            # User asked for "any team" or unspecified — show all sessions for the date
             results = self.schedule_loader.query_by_date(date_val)
+        else:
+            # No team, no gender, no specific date — show upcoming sessions (default)
+            results = self.schedule_loader.query_by_date(None)
 
         # Format results
         if not results:
@@ -689,6 +841,10 @@ class VolleyballRAGChat:
             with tracer.start_as_current_span("langgraph.node.retrieve_documents"):
                 return self.retrieve_documents(state)
 
+        def traced_search_web(state: GraphState) -> dict:
+            with tracer.start_as_current_span("langgraph.node.search_web"):
+                return self.search_web(state)
+
         def traced_generate_answer(state: GraphState) -> dict:
             with tracer.start_as_current_span("langgraph.node.generate_answer"):
                 return self.generate_answer(state)
@@ -710,6 +866,7 @@ class VolleyballRAGChat:
         builder.add_node("query_schedule", traced_query_schedule)
         builder.add_node("expand_query", traced_expand_query)
         builder.add_node("retrieve_documents", traced_retrieve_documents)
+        builder.add_node("search_web", traced_search_web)
         builder.add_node("generate_answer", traced_generate_answer)
         builder.add_node("critique_answer", traced_critique_answer)
 
@@ -748,7 +905,22 @@ class VolleyballRAGChat:
 
         # General/Document path
         builder.add_edge("expand_query", "retrieve_documents")
-        builder.add_edge("retrieve_documents", "generate_answer")
+
+        def route_after_retrieval(state: GraphState) -> str:
+            if state.get("use_web_search"):
+                return "search_web"
+            else:
+                return "generate_answer"
+
+        builder.add_conditional_edges(
+            "retrieve_documents",
+            route_after_retrieval,
+            {
+                "search_web": "search_web",
+                "generate_answer": "generate_answer",
+            }
+        )
+        builder.add_edge("search_web", "generate_answer")
 
         # Final steps
         builder.add_edge("generate_answer", "critique_answer")
@@ -773,25 +945,21 @@ class VolleyballRAGChat:
 
     def process_message(self, message: str, chat_history: Optional[List[Dict]] = None) -> str:
         """Process a user message and return the assistant's response."""
-        # Skip caching for schedule queries (dates change daily)
-        is_schedule = self._is_schedule_query(message)
+        # 1. Check memory cache first (instant, exact match) — only for non-schedule queries
+        if message in self.memory_cache:
+            print(f"[MEMORY CACHE HIT] Instant response for: '{message[:50]}...'")
+            return self.memory_cache[message]
 
-        if not is_schedule:
-            # 1. Check memory cache first (instant, exact match) — only for non-schedule queries
-            if message in self.memory_cache:
-                print(f"[MEMORY CACHE HIT] Instant response for: '{message[:50]}...'")
-                return self.memory_cache[message]
-
-            # 2. Check Chroma semantic cache (1 sec, similar questions) — only for non-schedule queries
-            cache_count = self.cache_store._collection.count()
-            if cache_count > 0:
-                try:
-                    cached_results = self.cache_store.similarity_search(message, k=1, score_threshold=0.90)
-                    if cached_results:
-                        print(f"[SEMANTIC CACHE HIT] Returning similar cached answer")
-                        return cached_results[0].metadata["answer"]
-                except Exception as e:
-                    pass
+        # 2. Check Chroma semantic cache (1 sec, similar questions) — only for non-schedule queries
+        cache_count = self.cache_store._collection.count()
+        if cache_count > 0:
+            try:
+                cached_results = self.cache_store.similarity_search(message, k=1, score_threshold=0.90)
+                if cached_results:
+                    print(f"[SEMANTIC CACHE HIT] Returning similar cached answer")
+                    return cached_results[0].metadata["answer"]
+            except Exception as e:
+                pass
 
         # 3. Cache miss or schedule query — run full RAG pipeline
 
@@ -806,6 +974,8 @@ class VolleyballRAGChat:
             "query_type": "general",
             "schedule_entities": {},
             "schedule_result": "",
+            "web_search_results": "",
+            "use_web_search": False,
         })
         answer = result["generated_answer"]
 
