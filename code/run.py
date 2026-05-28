@@ -23,11 +23,15 @@ parser.add_argument(
     "--share", action="store_true",
     help="Create a public Gradio share link"
 )
+parser.add_argument(
+    "--force-reindex", action="store_true",
+    help="Force rebuild the vector store from documents (clears existing index)"
+)
 args = parser.parse_args()
 
 if __name__ == "__main__":
     from app import create_demo
-    demo = create_demo()
+    demo = create_demo(force_reindex=args.force_reindex)
     demo.launch(
         server_name="0.0.0.0",
         server_port=args.port,

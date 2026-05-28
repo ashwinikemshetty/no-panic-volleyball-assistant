@@ -21,12 +21,12 @@ EXAMPLES = [
 ]
 
 
-def create_demo() -> gr.ChatInterface:
+def create_demo(force_reindex: bool = False) -> gr.ChatInterface:
     from rag import VolleyballRAGChat
 
     print("Initializing No Panic Volleyball Assistant...")
     chat = VolleyballRAGChat()
-    chat.initialize()
+    chat.initialize(force_reindex=force_reindex)
     print("Ready.")
 
     def respond(message: str, history: List[Dict[str, str]]) -> str:
